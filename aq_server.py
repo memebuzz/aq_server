@@ -2,11 +2,12 @@
 """AquesTalk10 + AqKanji2Koe 最小ローカルサーバー（Chrome拡張用）.
 
 拡張（memebuzz_chrome_extension/src/lib/aqserver.ts）はこのサーバーにだけ接続します:
-  GET  /version  -> {"engine": "aquesTalk10", "evalMode": bool, "kanji": bool}
-  POST /synth {"text": "...", "speed": 50-300} -> WAVバイナリ
+  GET  /version  -> {"engine": "aquesTalk10", "evalMode": bool, "kanji": bool, "voices": [...]}
+  POST /synth {"text": "...", "speed": 50-300, "voice": "reimu"|"marisa"|...} -> WAVバイナリ
 
 起動:
-  cd projects/aq_server
+  git clone https://github.com/memebuzz/aq_server
+  cd aq_server
   python3 aq_server.py --mock --port 50082      # ライブラリ無しでの動作確認用
   python3 aq_server.py --port 50082              # 実ライブラリ使用
   curl http://127.0.0.1:50082/version
@@ -23,7 +24,9 @@
 
 ライセンス:
   開発キー未設定でも起動しますが評価版動作（ナ行・マ行→ヌ）です。
-  AQ_DEV_KEY / AQ_USR_KEY / AQ_KANJI_DEV_KEY 環境変数か引数で指定してください。
+  優先順位: 引数 > 環境変数 > .env ファイル
+  (.env はカレントか本スクリプト隣に置くか --env-file で指定。詳細は .env.example 参照)
+  AQ_DEV_KEY / AQ_USR_KEY / AQ_KANJI_DEV_KEY のいずれかで指定してください。
   製品利用には開発・使用／頒布ライセンスが必要です（詳細はアクエストのサイト参照）。
 
 依存: Python標準ライブラリのみ（pip不要）。
@@ -37,10 +40,186 @@ import io
 import json
 import math
 import os
+import re
 import struct
 import sys
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def load_dotenv(env_file: str = "") -> str | None:
+    """最小 .env ローダー（標準ライブラリのみ・pip不要）.
+
+    - 既に設定済みの環境変数は上書きしない（優先順位: 引数 > 環境変数 > .env）
+    - `KEY=VALUE` 形式。空行・`#` コメント・`export ` 接頭辞に対応。
+      値の前後クォート（'/"）を外し、非クォート値の ` #` 以降はコメント扱い。
+    - 探索順: --env-file 指定 > カレントの .env > 本スクリプト隣の .env
+    - 戻り値は読み込んだファイルパス（無ければ None）。
+    """
+    candidates = (
+        [env_file]
+        if env_file
+        else [
+            os.path.join(os.getcwd(), ".env"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+        ]
+    )
+    for path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("export "):
+                        line = line[len("export ") :].lstrip()
+                    if "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    key = key.strip()
+                    if not key or key[0].isdigit() or not key.replace("_", "").isalnum():
+                        continue
+                    value = value.strip()
+                    if value[:1] in ("'", '"'):
+                        # 先頭クォート〜対応する閉じクォートまでを値とする（以降はコメント扱い）
+                        quote = value[0]
+                        chars: list[str] = []
+                        i = 1
+                        while i < len(value):
+                            c = value[i]
+                            if quote == '"' and c == "\\" and i + 1 < len(value):
+                                nxt = value[i + 1]
+                                chars.append({"n": "\n", "t": "\t"}.get(nxt, nxt))
+                                i += 2
+                                continue
+                            if c == quote:
+                                break
+                            chars.append(c)
+                            i += 1
+                        value = "".join(chars)
+                    else:
+                        # 非クォート値の末尾コメント（" #"）を除去
+                        hash_idx = value.find(" #")
+                        if hash_idx != -1:
+                            value = value[:hash_idx].rstrip()
+                    if key in os.environ:
+                        continue
+                    os.environ[key] = value
+        except OSError as e:
+            print(f"[aq_server] .env 読み込み失敗 ({path}): {e}", flush=True)
+            return None
+        return path
+    return None
+
+
+class AQTKVoice(ctypes.Structure):
+    """AquesTalk10 の声質パラメータ（全int・28バイト）."""
+
+    _fields_ = [
+        ("bas", ctypes.c_int),  # 基本素片 F1E/F2E/M1E (0/1/2)
+        ("spd", ctypes.c_int),  # 話速 50-300
+        ("vol", ctypes.c_int),  # 音量 0-300
+        ("pit", ctypes.c_int),  # 高さ 20-200
+        ("acc", ctypes.c_int),  # アクセント 0-200
+        ("lmd", ctypes.c_int),  # 音程1 0-200
+        ("fsc", ctypes.c_int),  # 音程2 50-200
+    ]
+
+
+# ゆっくり実況向けの声質プリセット一覧
+# AquesTalk10 公式プリセット（AqTk10App/MYukkuriVoice準拠）に基づくパラメータ
+VOICE_PRESETS: dict[str, dict[str, int | str]] = {
+    "reimu": {
+        "id": "reimu",
+        "name": "ゆっくり霊夢（女声1）",
+        "bas": 0,  # F1E
+        "vol": 100,
+        "pit": 100,
+        "acc": 100,
+        "lmd": 100,
+        "fsc": 100,
+    },
+    "marisa": {
+        "id": "marisa",
+        "name": "ゆっくり魔理沙（女声2）",
+        "bas": 1,  # F2E
+        "vol": 100,
+        "pit": 77,
+        "acc": 150,
+        "lmd": 100,
+        "fsc": 100,
+    },
+    "yukkuri_f3": {
+        "id": "yukkuri_f3",
+        "name": "女声3（高音・F3）",
+        "bas": 0,  # F1E
+        "vol": 100,
+        "pit": 100,
+        "acc": 100,
+        "lmd": 61,
+        "fsc": 148,
+    },
+    "yukkuri_m1": {
+        "id": "yukkuri_m1",
+        "name": "男声1（M1）",
+        "bas": 2,  # M1E
+        "vol": 100,
+        "pit": 30,
+        "acc": 100,
+        "lmd": 100,
+        "fsc": 100,
+    },
+    "yukkuri_r1": {
+        "id": "yukkuri_r1",
+        "name": "ロボット1（R1）",
+        "bas": 2,  # M1E
+        "vol": 100,
+        "pit": 30,
+        "acc": 20,
+        "lmd": 190,
+        "fsc": 100,
+    },
+}
+
+DEFAULT_VOICE_ID = "reimu"
+
+
+def resolve_voice_params(voice_arg: str | dict | None) -> dict[str, int]:
+    """プリセット名または辞書から AQTKVoice 用パラメータを解決する."""
+    base = dict(VOICE_PRESETS[DEFAULT_VOICE_ID])
+    if isinstance(voice_arg, str) and voice_arg in VOICE_PRESETS:
+        base = dict(VOICE_PRESETS[voice_arg])
+    elif isinstance(voice_arg, dict):
+        preset_id = voice_arg.get("id") or voice_arg.get("preset")
+        if isinstance(preset_id, str) and preset_id in VOICE_PRESETS:
+            base = dict(VOICE_PRESETS[preset_id])
+        for k in ("bas", "vol", "pit", "acc", "lmd", "fsc"):
+            if k in voice_arg and isinstance(voice_arg[k], (int, float)):
+                base[k] = int(voice_arg[k])
+    return {k: int(base[k]) for k in ("bas", "vol", "pit", "acc", "lmd", "fsc")}
+
+
+
+# AquesTalk10 公式マニュアルのエラーコード表（size に返る値）
+AQ_SYNTH_ERRORS = {
+    100: "その他のエラー",
+    101: "メモリ不足",
+    103: "音声記号列指定エラー（語頭の長音・促音の連続など）",
+    104: "音声記号列に有効な読みがない",
+    105: "未定義の読み記号（漢字や記号混じり。辞書なし時は漢字不可）",
+    106: "タグの指定が正しくない",
+    107: "タグの長さが制限を超過",
+    108: "タグ内の値の指定が正しくない",
+    120: "音声記号列が長すぎる（短く分割してください）",
+    121: "1フレーズ中の読み記号が多すぎる（短く分割してください）",
+    122: "音声記号列が長い（短く分割してください）",
+}
+
+# AqKanji2Koe が変換しきれなかった入力を検出するための範囲。
+# AquesTalk の音声記号列に漢字が残ると code=105 になる。
+KANJI_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 
 class Engine:
@@ -48,7 +227,14 @@ class Engine:
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.mock = args.mock
-        self.dic_dir = args.dic_dir
+        # 相対パスはまず起動ディレクトリを尊重し、見つからない場合は
+        # aq_server.py の隣を基準にする。リポジトリルートから起動しても辞書を読めるようにする。
+        dic_dir = args.dic_dir
+        if dic_dir and not os.path.exists(dic_dir):
+            script_relative_dic = os.path.join(os.path.dirname(os.path.abspath(__file__)), dic_dir)
+            if os.path.exists(script_relative_dic):
+                dic_dir = script_relative_dic
+        self.dic_dir = dic_dir
         self.dev_key = args.dev_key or os.environ.get("AQ_DEV_KEY", "")
         self.usr_key = args.usr_key or os.environ.get("AQ_USR_KEY", "")
         self.kanji_dev_key = args.kanji_dev_key or os.environ.get("AQ_KANJI_DEV_KEY", "")
@@ -107,13 +293,23 @@ class Engine:
                 if self.kanji_dev_key and hasattr(self.kanji_lib, "AqKanji2Koe_SetDevKey"):
                     self.kanji_lib.AqKanji2Koe_SetDevKey(self.kanji_dev_key.encode("utf-8"))
                 if hasattr(self.kanji_lib, "AqKanji2Koe_Create"):
-                    self.kanji_lib.AqKanji2Koe_Create.restype = ctypes.c_void_p
+                    create = self.kanji_lib.AqKanji2Koe_Create
+                    # 注意: 第2引数はエラーコード出力用の int*（NULL不可）。
+                    # 0 を渡すとネイティブ側の書き込みで segfault する。
+                    create.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+                    create.restype = ctypes.c_void_p
                     dic = self.dic_dir.encode("utf-8") if self.dic_dir else b""
-                    try:
-                        self.kanji_handle = self.kanji_lib.AqKanji2Koe_Create(dic, 0)
-                    except Exception:
-                        # 版により引数が違うため辞書パスのみで再試行
-                        self.kanji_handle = self.kanji_lib.AqKanji2Koe_Create(dic)
+                    kanji_err = ctypes.c_int(0)
+                    self.kanji_handle = create(dic, ctypes.byref(kanji_err))
+                    if not self.kanji_handle:
+                        # 例: code=200 は辞書読込失敗（aqdic.bin 等なし）、101 は辞書パス不正
+                        raise RuntimeError(
+                            f"辞書の読み込みに失敗しました（code={kanji_err.value}）。"
+                            "aq_dic/ に aqdic.bin・aq_user.dic を配置してください"
+                        )
+                    convert = self.kanji_lib.AqKanji2Koe_Convert
+                    convert.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+                    convert.restype = ctypes.c_int
             except Exception as e:  # noqa: BLE001
                 self.load_error = f"AqKanji2Koe初期化に失敗: {e}"
                 self.kanji_lib = None
@@ -130,39 +326,74 @@ class Engine:
         return not bool(self.dev_key)
 
     def version_payload(self) -> dict:
+        voices = [{"id": v["id"], "name": v["name"]} for v in VOICE_PRESETS.values()]
+        base_payload = {
+            "engine": "aquesTalk10",
+            "evalMode": self.eval_mode,
+            "kanji": self.kanji_available,
+            "voices": voices,
+            "defaultVoice": DEFAULT_VOICE_ID,
+        }
         if self.mock:
-            return {"engine": "aquesTalk10", "evalMode": True, "kanji": True, "mock": True}
+            base_payload["mock"] = True
+            return base_payload
         if self.aq_lib is None:
             return {
                 "engine": "not_initialized",
                 "evalMode": True,
                 "kanji": False,
+                "voices": voices,
+                "defaultVoice": DEFAULT_VOICE_ID,
                 "error": self.load_error or "エンジン未初期化",
             }
-        payload = {"engine": "aquesTalk10", "evalMode": self.eval_mode, "kanji": self.kanji_available}
         if self.load_error:
-            payload["error"] = self.load_error
-        return payload
+            base_payload["error"] = self.load_error
+        return base_payload
 
     # -- 合成 --
-    def synth(self, text: str, speed: int) -> bytes:
+    def synth(self, text: str, speed: int, voice: str | dict | None = None) -> bytes:
         speed = max(50, min(300, int(speed or 100)))
+        params = resolve_voice_params(voice)
         if self.mock or self.aq_lib is None:
             if self.aq_lib is None and not self.mock:
                 raise RuntimeError(self.load_error or "エンジン未初期化")
             return mock_wav(text, speed)
         koe = self.to_koe(text)
+        if KANJI_RE.search(koe):
+            raise RuntimeError(
+                "漢字を読みへ変換できませんでした。AqKanji2Koeの辞書（aq_dic/aqdic.bin）を確認してください"
+            )
         synth_fn = getattr(self.aq_lib, "AquesTalk_Synthe_Utf8", None) or getattr(
             self.aq_lib, "AquesTalk_Synth", None
         )
-        free_fn = getattr(self.aq_lib, "AquesTalk_FreeWav", None)
+        # 版により FreeWave / FreeWav の表記揺れがある
+        free_fn = getattr(self.aq_lib, "AquesTalk_FreeWave", None) or getattr(
+            self.aq_lib, "AquesTalk_FreeWav", None
+        )
         if synth_fn is None or free_fn is None:
-            raise RuntimeError("AquesTalk_Synthe_Utf8 が見つかりません（版を確認してください）")
+            raise RuntimeError("音声合成関数が見つかりません（版を確認してください）")
+        free_fn.argtypes = [ctypes.c_void_p]
+        free_fn.restype = None
         size = ctypes.c_int(0)
-        synth_fn.restype = ctypes.c_void_p
-        ptr = synth_fn(koe.encode("utf-8"), ctypes.c_int(speed), ctypes.byref(size))
+        if getattr(synth_fn, "__name__", "") == "AquesTalk_Synth":
+            # 旧版API: Synth(koe, speed, size)
+            synth_fn.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+            synth_fn.restype = ctypes.c_void_p
+            ptr = synth_fn(koe.encode("utf-8"), ctypes.c_int(speed), ctypes.byref(size))
+        else:
+            # AquesTalk10: Synthe_Utf8(voice, koe, size)
+            synth_fn.argtypes = [
+                ctypes.POINTER(AQTKVoice),
+                ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_int),
+            ]
+            synth_fn.restype = ctypes.c_void_p
+            voice_obj = AQTKVoice(spd=speed, **params)
+            ptr = synth_fn(ctypes.byref(voice_obj), koe.encode("utf-8"), ctypes.byref(size))
         if not ptr or size.value <= 0:
-            raise RuntimeError("音声合成に失敗しました（記号列を確認してください）")
+            code = size.value if size.value > 0 else 0
+            reason = AQ_SYNTH_ERRORS.get(code, "記号列を確認してください")
+            raise RuntimeError(f"音声合成に失敗しました（code={code}: {reason}）")
         try:
             return ctypes.string_at(ptr, size.value)
         finally:
@@ -172,7 +403,7 @@ class Engine:
                 pass
 
     def to_koe(self, text: str) -> str:
-        """漢字混じり文→音声記号列。辞書無し時は入力をそのまま返す."""
+        """漢字混じり文を音声記号列へ変換する。かな文はそのまま返す."""
         if self.kanji_lib is None or self.kanji_handle is None:
             return text
         try:
@@ -184,10 +415,14 @@ class Engine:
                 buf,
                 ctypes.c_int(ctypes.sizeof(buf)),
             )
-            if n and buf.value:
+            # AqKanji2Koe_Convert は成功時に戻り値 0 を返し、読み列は
+            # 出力バッファへ書き込む。戻り値だけで成功判定してはいけない。
+            if buf.value:
                 return buf.value.decode("utf-8", errors="replace")
-        except Exception:  # noqa: BLE001 - フォールバックで入力を返す
-            pass
+            if n:
+                raise RuntimeError(f"変換エラー（code={n}）")
+        except Exception as e:  # noqa: BLE001 - HTTP経由で原因を返す
+            raise RuntimeError(f"AqKanji2Koeの漢字変換に失敗しました: {e}") from e
         return text
 
 
@@ -258,8 +493,9 @@ class Handler(BaseHTTPRequestHandler):
         if not text:
             self._json({"error": "text が空です"}, 400)
             return
+        voice = data.get("voice") or data.get("preset") or DEFAULT_VOICE_ID
         try:
-            wav = self.engine.synth(text, int(data.get("speed", 100)))
+            wav = self.engine.synth(text, int(data.get("speed", 100)), voice)
         except (RuntimeError, ValueError, OSError) as e:
             self._json({"error": str(e)}, 500)
             return
@@ -282,15 +518,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dev-key", default="")
     p.add_argument("--usr-key", default="")
     p.add_argument("--kanji-dev-key", default="")
+    p.add_argument(
+        "--env-file",
+        default="",
+        help=".env のパス（未指定時はカレント・スクリプト隣の .env を自動探索）",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    env_path = load_dotenv(args.env_file)
     Handler.engine = Engine(args)
     payload = Handler.engine.version_payload()
     mode = "mock" if args.mock else ("real" if Handler.engine.aq_lib else "missing-lib")
     print(f"[aq_server] http://{args.host}:{args.port} mode={mode} {payload}", flush=True)
+    if env_path:
+        print(f"[aq_server] .env 読み込み: {env_path}", flush=True)
     if mode == "missing-lib":
         print(f"[aq_server] {payload.get('error')} (--mock で配線確認できます)", flush=True)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
