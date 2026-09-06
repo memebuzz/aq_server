@@ -1,4 +1,4 @@
-# aq_server — AquesTalk10 最小ローカルサーバー（Chrome拡張用）
+# aq_server — AquesTalk1/10 最小ローカルサーバー（Chrome拡張用）
 
 `memebuzz_chrome_extension`（`src/lib/aqserver.ts`）は `http://127.0.0.1:50082` のこのサーバーにだけ接続します。
 標準ライブラリのみ・`pip install` 不要です。
@@ -15,22 +15,53 @@ curl http://127.0.0.1:50082/version
 # {"engine": "aquesTalk10", ...} が返ればOK
 
 # 2) 実ライブラリ使用（アクエストから別途取得）
-# lib/ に dylib/so、aq_dic/ に辞書を配置
+# lib/ に dylib/so、aq_dic/ に辞書を配置。
+# AquesTalk10 と AquesTalk1 は同居できます（見つかった分だけ両方ロード）。
+# Chrome拡張側の「AquesTalk10 / AquesTalk1」切替はリクエストごとの engine 指定で行います。
 python3 aq_server.py --port 50082 \
   --aquestalk-lib ./lib/libAquesTalk10.dylib \
+  --aquestalk1-lib ./lib \
   --kanji-lib ./lib/libAqKanji2Koe.dylib \
   --dic-dir ./aq_dic
+
+# ※ AquesTalk1 は声ごとに別ライブラリです（単一の libAquesTalk.dylib ではありません）。
+#    lib/ に libAquesTalk1-f1.dylib, libAquesTalk1-m1.dylib, … を配置してください。
+#    旧来の単一 libAquesTalk.dylib がある場合は f1 扱いで使います。
+# ※ --engine / AQ_ENGINE はデフォルトエンジン（旧クライアント互換表示用）の指定です。
+#    省略時は aquestalk10。両方ある場合も /synth の engine 指定でいつでも切替できます。
+
+# 3) MeCab+NEologdによる漢字読み精度向上（pip install mecab-python3 等が必要）:
+  # リポジトリにサブモジュールとして含めています（projects/mecab-ipadic-neologd）
+  # 初回のみビルドが必要:
+  cd ../mecab-ipadic-neologd
+  ./bin/install-mecab-ipadic-neologd -n -y  # システム辞書としてインストール（要sudo）
+  # またはユーザー辞書としてビルド（sudo不要）:
+  ./bin/install-mecab-ipadic-neologd -n --prefix=$(pwd)/build
+  cd ../aq_server
+
+  # 起動（ビルド済み辞書を指定）:
+  python3 aq_server.py --port 50082 \
+    --engine aquestalk10 \
+    --aquestalk-lib ./lib/libAquesTalk10.dylib \
+    --kanji-lib ./lib/libAqKanji2Koe.dylib \
+    --dic-dir ./aq_dic \
+    --mecab-dic ../mecab-ipadic-neologd/build/lib/mecab/dic/ipadic-neologd
+
+# または .env に記述（リポジトリルートから起動する場合）:
+  AQ_MECAB_DIC=../mecab-ipadic-neologd/build/lib/mecab/dic/ipadic-neologd
 ```
 
 ## エンドポイント
 
 | Method | Path | 説明 |
 |--------|------|------|
-| GET | `/version` | `{engine, evalMode, kanji, voices, defaultVoice}` を返す |
-| POST | `/synth` | `{text, speed: 50-300, voice: "reimu"|"marisa"|...}` → WAV |
+| GET | `/version` | `{engine, defaultEngine, evalMode, kanji, voices, defaultVoice, engines: {aquestalk10, aquestalk1}}` を返す |
+| POST | `/synth` | `{text, speed: 50-300, voice: "reimu"\|"f1"\|..., engine: "aquestalk10"\|"aquestalk1"}` → WAV（`engine` 省略時はデフォルトエンジン） |
 | GET | `/health` | 疎通確認用 |
 
 ### 利用可能なボイスプリセット
+
+#### AquesTalk10
 
 | ID | 名称 | 特徴 |
 |----|------|------|
@@ -39,6 +70,20 @@ python3 aq_server.py --port 50082 \
 | `yukkuri_f3` | 女声3（高音・F3） | F1Eベース・高音寄り |
 | `yukkuri_m1` | 男声1（M1） | M1Eベース・男性ボイス |
 | `yukkuri_r1` | ロボット1（R1） | M1Eベース・ロボット調 |
+
+#### AquesTalk1（配置した声別ライブラリから動的に公開）
+
+| ID | 名称 | 対応ライブラリ |
+|----|------|------|
+| `f1` (デフォルト) | 女性1 (F1) | libAquesTalk1-f1.dylib |
+| `f2` | 女性2 (F2) | libAquesTalk1-f2.dylib |
+| `f3` | 女性3 (F3) | libAquesTalk1-f3.dylib |
+| `m1` | 男性1 (M1) | libAquesTalk1-m1.dylib |
+| `m2` | 男性2 (M2) | libAquesTalk1-m2.dylib |
+| `r1`（別名 `robot`） | ロボット (R1) | libAquesTalk1-r1.dylib |
+| `dvd` / `jgr` / `imd1` | （同名の声） | 対応する libAquesTalk1-*.dylib |
+
+※ 話速は両エンジンとも 50-300 を受け付けます。
 
 
 ## ライセンス注意
